@@ -1,6 +1,7 @@
 ﻿# services/wikivoyage_cleaner.py
 from __future__ import annotations
 
+import html
 import re
 from bs4 import BeautifulSoup
 from typing import Dict, Any, List
@@ -22,7 +23,7 @@ def _shorten(s: str, max_len: int = 160) -> str:
     return cut + "…"
 
 def extract_items_from_section_html(html: str, limit: int = 20) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     items: List[str] = []
 
     # listings
