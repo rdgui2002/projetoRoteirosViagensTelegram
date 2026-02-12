@@ -1,12 +1,22 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import io
 import logging
 import os
 import re
+from decimal import Decimal, InvalidOperation
 
+import httpx
 from dotenv import load_dotenv
-from telegram import InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+    WebAppInfo,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,23 +27,30 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+from services.email_service import send_email_with_pdf
+from services.pdf_service import build_pdf_bytes
+from services.presenter import format_trip_output, trip_to_pdf_lines
 from services.trip_logic_wikivoyage import (
+    DestinationIsCountryError,
+    RITMOS_VALIDOS,
     TripPreferences,
     build_itinerary_from_wikivoyage,
     detect_country_destination,
-    DestinationIsCountryError,
-    RITMOS_VALIDOS,
 )
-from services.presenter import format_trip_output, trip_to_pdf_lines
-from services.pdf_service import build_pdf_bytes
-from services.email_service import send_email_with_pdf
 from services.utils import parse_date_br
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
-    raise SystemExit("ERRO: defina TELEGRAM_BOT_TOKEN no .env")
+    raise SystemExit("ERRO: defina TELEGRAM_BOT_TOKEN (ou BOT_TOKEN) no .env")
+
+PUBLIC_BACKEND_BASE = os.getenv("PUBLIC_BACKEND_BASE", "").strip().rstrip("/")
+MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip()
+if not MINIAPP_URL and PUBLIC_BACKEND_BASE:
+    MINIAPP_URL = f"{PUBLIC_BACKEND_BASE}/miniapp"
+
+TEST_BYPASS_ENABLED = os.getenv("TEST_BYPASS_ENABLED", "0").strip() == "1"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -41,6 +58,165 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 (NOME, EMAIL, DESTINO, DATA_IDA, DATA_VOLTA, RITMO, CONFIRMAR) = range(7)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _env_decimal(name: str, default: str) -> Decimal:
+    raw = os.getenv(name, default).strip()
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        logging.warning("Valor invalido em %s=%r. Usando %s", name, raw, default)
+        return Decimal(default)
+
+
+def _env_float(name: str, default: str) -> float:
+    raw = os.getenv(name, default).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        logging.warning("Valor invalido em %s=%r. Usando %s", name, raw, default)
+        return float(default)
+
+
+def _env_user_ids(name: str) -> set[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return set()
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.add(int(part))
+        except ValueError:
+            logging.warning("Ignorando user_id invalido em %s: %r", name, part)
+    return values
+
+
+COST_ROTEIRO_COMMAND = _env_decimal("COST_ROTEIRO_COMMAND", "1.00")
+WALLET_HTTP_TIMEOUT = _env_float("WALLET_HTTP_TIMEOUT", "20")
+TEST_BYPASS_USER_IDS = _env_user_ids("TEST_BYPASS_USER_IDS")
+
+
+def money_fmt(value: Decimal) -> str:
+    return f"R$ {value.quantize(Decimal('0.01'))}"
+
+
+def miniapp_kb() -> InlineKeyboardMarkup | None:
+    if not MINIAPP_URL:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Recarregar via Pix", web_app=WebAppInfo(url=MINIAPP_URL))]
+        ]
+    )
+
+
+def is_bypass_user(telegram_id: int) -> bool:
+    return TEST_BYPASS_ENABLED and telegram_id in TEST_BYPASS_USER_IDS
+
+
+async def get_balance_api(telegram_id: int) -> Decimal:
+    if not PUBLIC_BACKEND_BASE:
+        raise RuntimeError("PUBLIC_BACKEND_BASE_not_configured")
+    async with httpx.AsyncClient(timeout=WALLET_HTTP_TIMEOUT) as client:
+        response = await client.get(
+            f"{PUBLIC_BACKEND_BASE}/api/balance",
+            params={"telegram_id": telegram_id},
+        )
+    response.raise_for_status()
+    data = response.json()
+    return Decimal(str(data["balance"]))
+
+
+async def spend_api(telegram_id: int, amount: Decimal) -> dict | None:
+    if not PUBLIC_BACKEND_BASE:
+        raise RuntimeError("PUBLIC_BACKEND_BASE_not_configured")
+    async with httpx.AsyncClient(timeout=WALLET_HTTP_TIMEOUT) as client:
+        response = await client.post(
+            f"{PUBLIC_BACKEND_BASE}/api/spend",
+            json={"telegram_id": telegram_id, "amount": str(amount)},
+        )
+    if response.status_code == 402:
+        return None
+    response.raise_for_status()
+    return response.json()
+
+
+async def charge_or_block(update: Update, amount: Decimal, service_name: str) -> bool:
+    if not update.effective_user or not update.message:
+        return False
+
+    if amount <= 0:
+        return True
+    if is_bypass_user(update.effective_user.id):
+        return True
+
+    try:
+        spend_result = await spend_api(update.effective_user.id, amount)
+    except Exception as exc:
+        await update.message.reply_text(f"Erro ao cobrar saldo: {type(exc).__name__}: {exc}")
+        return False
+
+    if spend_result is not None:
+        return True
+
+    try:
+        balance = await get_balance_api(update.effective_user.id)
+        balance_text = money_fmt(balance)
+    except Exception:
+        balance_text = "indisponivel"
+
+    await update.message.reply_text(
+        f"Saldo insuficiente para {service_name}.\n"
+        f"Custo: {money_fmt(amount)}\n"
+        f"Seu saldo: {balance_text}\n\n"
+        "Recarregue para continuar:",
+        reply_markup=miniapp_kb(),
+    )
+    return False
+
+
+async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    if not update.effective_user or not update.message:
+        return
+    try:
+        balance = await get_balance_api(update.effective_user.id)
+    except Exception as exc:
+        await update.message.reply_text(f"Erro ao consultar saldo: {type(exc).__name__}: {exc}")
+        return
+    await update.message.reply_text(f"Seu saldo: {money_fmt(balance)}", reply_markup=miniapp_kb())
+
+
+async def cmd_recarregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    if not update.message:
+        return
+    if not MINIAPP_URL:
+        await update.message.reply_text("MINIAPP_URL nao configurada no .env.")
+        return
+    await update.message.reply_text("Clique para recarregar via Pix:", reply_markup=miniapp_kb())
+
+
+async def cmd_servicos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "Servicos pagos:\n"
+        f"- Gerar roteiro IA: {money_fmt(COST_ROTEIRO_COMMAND)}\n\n"
+        "Comandos: /saldo /recarregar",
+        reply_markup=miniapp_kb(),
+    )
+
+
+async def cmd_meuid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    if not update.effective_user or not update.message:
+        return
+    await update.message.reply_text(f"Seu Telegram ID: {update.effective_user.id}")
 
 
 def init_user_state(context: ContextTypes.DEFAULT_TYPE):
@@ -56,8 +232,11 @@ def init_user_state(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     init_user_state(context)
+    if not update.message:
+        return NOME
     await update.message.reply_text(
-        "Fala! 👋 Antes de começar, me diz seu nome?",
+        "Fala! Antes de comecar, me diz seu nome?\n"
+        f"Custo para gerar roteiro: {money_fmt(COST_ROTEIRO_COMMAND)}",
         reply_markup=ReplyKeyboardRemove(),
     )
     return NOME
@@ -66,7 +245,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def set_nome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     nome = (update.message.text or "").strip()
     if len(nome) < 2:
-        await update.message.reply_text("Pode me dizer seu nome (apelido também serve)?")
+        await update.message.reply_text("Pode me dizer seu nome (apelido tambem serve)?")
         return NOME
 
     context.user_data["prefs"]["nome"] = nome
@@ -74,7 +253,7 @@ async def set_nome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Boa! Agora me manda seu e-mail pra eu te enviar o PDF no final.\n"
         "Ex: nome@gmail.com\n\n"
-        "Se não quiser enviar por e-mail, digita: pular",
+        "Se nao quiser enviar por e-mail, digita: pular",
         reply_markup=ReplyKeyboardRemove(),
     )
     return EMAIL
@@ -88,13 +267,13 @@ async def set_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data["prefs"]["email"] = ""
     else:
         if not EMAIL_RE.match(txt):
-            await update.message.reply_text("Esse e-mail parece inválido. Tenta de novo ou digita 'pular'.")
+            await update.message.reply_text("Esse e-mail parece invalido. Tenta de novo ou digita 'pular'.")
             return EMAIL
         context.user_data["prefs"]["email"] = txt
 
     nome = context.user_data["prefs"]["nome"]
     await update.message.reply_text(
-        f"Fechado, {nome}! ✈️\n\nAgora manda o destino (cidade).\n"
+        f"Fechado, {nome}!\n\nAgora manda o destino (cidade).\n"
         "Ex: Barcelona, Rio de Janeiro, Cairo, Tokyo.",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -104,14 +283,14 @@ async def set_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def set_destino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     destino = (update.message.text or "").strip()
     if len(destino) < 2:
-        await update.message.reply_text("Manda uma cidade válida. Ex: Cairo.")
+        await update.message.reply_text("Manda uma cidade valida. Ex: Cairo.")
         return DESTINO
 
-    # Corrige NA HORA se for país/região
+    # Corrige na hora se for pais/regiao.
     msg_country = await detect_country_destination(destino)
     if msg_country:
         await update.message.reply_text(msg_country)
-        await update.message.reply_text("Agora me diga a CIDADE (ex: Cairo, Luxor, Aswan). 👇")
+        await update.message.reply_text("Agora me diga a CIDADE (ex: Cairo, Luxor, Aswan).")
         return DESTINO
 
     context.user_data["prefs"]["destino"] = destino
@@ -124,7 +303,7 @@ async def set_data_ida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         d = parse_date_br(update.message.text)
         context.user_data["prefs"]["data_ida"] = d.strftime("%d/%m/%Y")
     except Exception:
-        await update.message.reply_text("Não entendi a data. Tenta assim: 10/03/2026")
+        await update.message.reply_text("Nao entendi a data. Tenta assim: 10/03/2026")
         return DATA_IDA
 
     await update.message.reply_text("Data de volta? (ex: 15/03/2026)")
@@ -138,14 +317,14 @@ async def set_data_volta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if volta <= ida:
             await update.message.reply_text(
-                "Essa volta tá antes (ou igual) à ida. A volta precisa ser depois.\n"
+                "Essa volta esta antes (ou igual) a ida. A volta precisa ser depois.\n"
                 "Tenta de novo (ex: 15/03/2026)."
             )
             return DATA_VOLTA
 
         context.user_data["prefs"]["data_volta"] = volta.strftime("%d/%m/%Y")
     except Exception:
-        await update.message.reply_text("Não entendi a data. Tenta assim: 15/03/2026")
+        await update.message.reply_text("Nao entendi a data. Tenta assim: 15/03/2026")
         return DATA_VOLTA
 
     kb = ReplyKeyboardMarkup([["leve", "médio"], ["intenso"]], resize_keyboard=True, one_time_keyboard=True)
@@ -166,13 +345,14 @@ async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     p = context.user_data["prefs"]
     resumo = (
-        "🔎 Resumo\n"
-        f"• Nome: {p['nome']}\n"
-        f"• Email: {p['email'] if p['email'] else 'não informado'}\n"
-        f"• Destino: {p['destino']}\n"
-        f"• Datas: {p['data_ida']} → {p['data_volta']}\n"
-        f"• Ritmo: {p['ritmo']}\n\n"
-        "Confirmar e gerar roteiro? (sim/não)"
+        "Resumo\n"
+        f"- Nome: {p['nome']}\n"
+        f"- Email: {p['email'] if p['email'] else 'nao informado'}\n"
+        f"- Destino: {p['destino']}\n"
+        f"- Datas: {p['data_ida']} -> {p['data_volta']}\n"
+        f"- Ritmo: {p['ritmo']}\n"
+        f"- Custo: {money_fmt(COST_ROTEIRO_COMMAND)}\n\n"
+        "Confirmar e gerar roteiro? (sim/nao)"
     )
     kb = ReplyKeyboardMarkup([["sim", "não"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(resumo, reply_markup=kb)
@@ -182,8 +362,11 @@ async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def confirm_and_generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ans = (update.message.text or "").strip().lower()
     if ans not in ["sim", "s", "yes"]:
-        await update.message.reply_text("Beleza! Se quiser recomeçar: /start", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Beleza! Se quiser recomecar: /start", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
+
+    if not await charge_or_block(update, COST_ROTEIRO_COMMAND, "gerar roteiro IA"):
+        return CONFIRMAR
 
     p = context.user_data["prefs"]
     prefs = TripPreferences(
@@ -194,69 +377,73 @@ async def confirm_and_generate(update: Update, context: ContextTypes.DEFAULT_TYP
         ritmo=p["ritmo"],
     )
 
-    await update.message.reply_text("Boa! Tô montando seu roteiro… ✈️", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Boa! To montando seu roteiro...", reply_markup=ReplyKeyboardRemove())
 
     try:
         trip = await build_itinerary_from_wikivoyage(prefs)
-    except DestinationIsCountryError as e:
-        await update.message.reply_text(str(e))
-        await update.message.reply_text("Me manda a CIDADE (ex: Cairo). 👇")
+    except DestinationIsCountryError as exc:
+        await update.message.reply_text(str(exc))
+        await update.message.reply_text("Me manda a CIDADE (ex: Cairo).")
         return DESTINO
-    except Exception as e:
-        await update.message.reply_text(f"Deu ruim ao gerar o roteiro: {e}")
+    except Exception as exc:
+        await update.message.reply_text(f"Deu ruim ao gerar o roteiro: {exc}")
         return ConversationHandler.END
 
-    # Texto no chat (SEM Markdown)
     out = format_trip_output(trip)
-    MAX = 3500
-    chunks = [out[i:i + MAX] for i in range(0, len(out), MAX)]
-    for c in chunks:
-        await update.message.reply_text(c)
+    max_chars = 3500
+    chunks = [out[i : i + max_chars] for i in range(0, len(out), max_chars)]
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
 
-    # PDF
     title = f"Roteiro de Viagem - {trip.get('nome', '')}".strip()
-    subtitle = f"{trip['destino']} | {trip['ida']} → {trip['volta']}"
+    subtitle = f"{trip['destino']} | {trip['ida']} -> {trip['volta']}"
     pdf_lines = trip_to_pdf_lines(trip)
     pdf_bytes = build_pdf_bytes(title=title, subtitle=subtitle, lines=pdf_lines)
 
     await update.message.reply_document(
         document=InputFile(io.BytesIO(pdf_bytes), filename="roteiro.pdf"),
-        caption=f"📄 Aqui está seu roteiro em PDF, {trip.get('nome','')}!",
+        caption=f"Aqui esta seu roteiro em PDF, {trip.get('nome', '')}!",
     )
 
-    # Email informado pelo usuário
     user_email = (p.get("email") or "").strip()
     if user_email:
         status = send_email_with_pdf(
             to_email=user_email,
-            subject=f"Seu roteiro: {trip['destino']} ({trip['ida']} → {trip['volta']})",
+            subject=f"Seu roteiro: {trip['destino']} ({trip['ida']} -> {trip['volta']})",
             body=(
-                f"Olá {trip.get('nome','')},\n\n"
+                f"Ola {trip.get('nome', '')},\n\n"
                 f"Segue em anexo seu roteiro para {trip['destino']}.\n"
-                "Se quiser, eu adapto por bairro/onde você vai ficar.\n"
+                "Se quiser, eu adapto por bairro/onde voce vai ficar.\n"
             ),
             pdf_bytes=pdf_bytes,
         )
         await update.message.reply_text(status)
     else:
-        await update.message.reply_text("📧 Você pulou o e-mail — então só enviei o PDF aqui no Telegram.")
+        await update.message.reply_text("Voce pulou o e-mail, entao so enviei o PDF aqui no Telegram.")
 
     await update.message.reply_text("Quer gerar outro? /start")
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Fechado. Se quiser recomeçar: /start", reply_markup=ReplyKeyboardRemove())
+    del context
+    await update.message.reply_text("Fechado. Se quiser recomecar: /start", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del update
     logging.exception("ERR: %s", context.error)
 
 
 def main():
     request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
     app = Application.builder().token(TOKEN).request(request).build()
+
+    app.add_handler(CommandHandler("saldo", cmd_saldo))
+    app.add_handler(CommandHandler("recarregar", cmd_recarregar))
+    app.add_handler(CommandHandler("servicos", cmd_servicos))
+    app.add_handler(CommandHandler("meuid", cmd_meuid))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -277,7 +464,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_error_handler(error_handler)
 
-    print("✅ Bot rodando. Aperte Ctrl+C para parar.")
+    print("Bot rodando Ok")
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
