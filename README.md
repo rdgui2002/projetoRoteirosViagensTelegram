@@ -1,20 +1,19 @@
 # projetoRoteirosViagensTelegram
 
-Deploy no Render (Webhook / Web Service):
+Deploy no Render (Polling / Worker):
 
-- Tipo de servico: `Web Service`
+- Tipo de servico: `Worker`
 - Build Command: `pip install -r requirements.txt`
-- Start Command: `uvicorn bot:web_app --host 0.0.0.0 --port $PORT`
+- Start Command: `python bot.py`
 
 Variaveis minimas:
 
 - `TELEGRAM_BOT_TOKEN`
-- `WEBHOOK_BASE_URL` (ex: `https://seu-servico.onrender.com`)
-- `TELEGRAM_WEBHOOK_SECRET` (recomendado)
-- `PUBLIC_BACKEND_BASE`
-- `MINIAPP_URL`
-- `COST_ROTEIRO_COMMAND`
 
-Webhook default path:
+Variaveis opcionais (envio por e-mail):
 
-- `/telegram/webhook`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_FROM`

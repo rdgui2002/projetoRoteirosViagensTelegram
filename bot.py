@@ -4,21 +4,17 @@ import io
 import logging
 import os
 import re
-from contextlib import asynccontextmanager
-from decimal import Decimal, InvalidOperation
 
-import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
 from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
     InputFile,
+    KeyboardButton,
+    MenuButtonCommands,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
-    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -48,178 +44,100 @@ TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip(
 if not TOKEN:
     raise SystemExit("ERRO: defina TELEGRAM_BOT_TOKEN (ou BOT_TOKEN) no .env")
 
-PUBLIC_BACKEND_BASE = os.getenv("PUBLIC_BACKEND_BASE", "").strip().rstrip("/")
-MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip()
-if not MINIAPP_URL and PUBLIC_BACKEND_BASE:
-    MINIAPP_URL = f"{PUBLIC_BACKEND_BASE}/miniapp"
-
-TEST_BYPASS_ENABLED = os.getenv("TEST_BYPASS_ENABLED", "0").strip() == "1"
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-
-if not WEBHOOK_PATH.startswith("/"):
-    WEBHOOK_PATH = f"/{WEBHOOK_PATH}"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Estados
-(NOME, EMAIL, DESTINO, DATA_IDA, DATA_VOLTA, RITMO, CONFIRMAR) = range(7)
+# Conversation states
+(HOME, NOME, EMAIL, DESTINO, DATA_IDA, DATA_VOLTA, RITMO, CONFIRMAR) = range(8)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-tg_app: Application | None = None
+START_TEXTS = {"iniciar", "comecar", "start"}
+MENU_TEXTS = {"menu"}
+START_SHORTCUT_FILTER = filters.Regex(r"(?i)^(iniciar|comecar|start)$")
+MENU_SHORTCUT_FILTER = filters.Regex(r"(?i)^menu$")
+TEXT_FLOW_FILTER = filters.TEXT & ~filters.COMMAND & ~START_SHORTCUT_FILTER & ~MENU_SHORTCUT_FILTER
+
+WELCOME_TEXT = (
+    "<b>Planejador IA de Viagens</b>\n"
+    "Seu roteiro personalizado em poucos minutos.\n\n"
+    "<b>O que este bot pode fazer?</b>\n"
+    "- Montar um roteiro dia a dia\n"
+    "- Ajustar sugestoes ao seu ritmo (leve, medio ou intenso)\n"
+    "- Gerar PDF e enviar aqui no Telegram\n"
+    "- Enviar por e-mail (opcional)\n\n"
+    "<i>Toque em Iniciar para usar este bot.</i>"
+)
+
+MENU_TEXT = (
+    "<b>Menu</b>\n"
+    "- Iniciar: comeca um novo roteiro\n"
+    "- /start: voltar para a tela inicial\n"
+    "- /cancel: cancelar o fluxo atual\n"
+    "- /meuid: ver seu Telegram ID"
+)
+
+BOT_COMMANDS = [
+    BotCommand("start", "Iniciar"),
+    BotCommand("iniciar", "Iniciar"),
+    BotCommand("menu", "Abrir menu"),
+    BotCommand("cancel", "Cancelar"),
+    BotCommand("meuid", "Ver meu ID"),
+]
 
 
-def _env_decimal(name: str, default: str) -> Decimal:
-    raw = os.getenv(name, default).strip()
-    try:
-        return Decimal(raw)
-    except (InvalidOperation, ValueError):
-        logging.warning("Valor invalido em %s=%r. Usando %s", name, raw, default)
-        return Decimal(default)
-
-
-def _env_float(name: str, default: str) -> float:
-    raw = os.getenv(name, default).strip()
-    try:
-        return float(raw)
-    except ValueError:
-        logging.warning("Valor invalido em %s=%r. Usando %s", name, raw, default)
-        return float(default)
-
-
-def _env_user_ids(name: str) -> set[int]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return set()
-    values: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            values.add(int(part))
-        except ValueError:
-            logging.warning("Ignorando user_id invalido em %s: %r", name, part)
-    return values
-
-
-COST_ROTEIRO_COMMAND = _env_decimal("COST_ROTEIRO_COMMAND", "1.00")
-WALLET_HTTP_TIMEOUT = _env_float("WALLET_HTTP_TIMEOUT", "20")
-TEST_BYPASS_USER_IDS = _env_user_ids("TEST_BYPASS_USER_IDS")
-
-
-def money_fmt(value: Decimal) -> str:
-    return f"R$ {value.quantize(Decimal('0.01'))}"
-
-
-def miniapp_kb() -> InlineKeyboardMarkup | None:
-    if not MINIAPP_URL:
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Recarregar via Pix", web_app=WebAppInfo(url=MINIAPP_URL))]
-        ]
+def home_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton("Iniciar"), KeyboardButton("Menu")]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
 
-def is_bypass_user(telegram_id: int) -> bool:
-    return TEST_BYPASS_ENABLED and telegram_id in TEST_BYPASS_USER_IDS
+async def show_menu_message(target_message) -> None:
+    await target_message.reply_text(
+        MENU_TEXT,
+        parse_mode="HTML",
+        reply_markup=home_kb(),
+    )
 
 
-async def get_balance_api(telegram_id: int) -> Decimal:
-    if not PUBLIC_BACKEND_BASE:
-        raise RuntimeError("PUBLIC_BACKEND_BASE_not_configured")
-    async with httpx.AsyncClient(timeout=WALLET_HTTP_TIMEOUT) as client:
-        response = await client.get(
-            f"{PUBLIC_BACKEND_BASE}/api/balance",
-            params={"telegram_id": telegram_id},
-        )
-    response.raise_for_status()
-    data = response.json()
-    return Decimal(str(data["balance"]))
-
-
-async def spend_api(telegram_id: int, amount: Decimal) -> dict | None:
-    if not PUBLIC_BACKEND_BASE:
-        raise RuntimeError("PUBLIC_BACKEND_BASE_not_configured")
-    async with httpx.AsyncClient(timeout=WALLET_HTTP_TIMEOUT) as client:
-        response = await client.post(
-            f"{PUBLIC_BACKEND_BASE}/api/spend",
-            json={"telegram_id": telegram_id, "amount": str(amount)},
-        )
-    if response.status_code == 402:
-        return None
-    response.raise_for_status()
-    return response.json()
-
-
-async def charge_or_block(update: Update, amount: Decimal, service_name: str) -> bool:
-    if not update.effective_user or not update.message:
-        return False
-
-    if amount <= 0:
-        return True
-    if is_bypass_user(update.effective_user.id):
-        return True
-
-    try:
-        spend_result = await spend_api(update.effective_user.id, amount)
-    except Exception as exc:
-        await update.message.reply_text(f"Erro ao cobrar saldo: {type(exc).__name__}: {exc}")
-        return False
-
-    if spend_result is not None:
-        return True
-
-    try:
-        balance = await get_balance_api(update.effective_user.id)
-        balance_text = money_fmt(balance)
-    except Exception:
-        balance_text = "indisponivel"
-
+async def begin_flow(update: Update) -> int:
+    if not update.message:
+        return HOME
     await update.message.reply_text(
-        f"Saldo insuficiente para {service_name}.\n"
-        f"Custo: {money_fmt(amount)}\n"
-        f"Seu saldo: {balance_text}\n\n"
-        "Recarregue para continuar:",
-        reply_markup=miniapp_kb(),
+        "Perfeito! Antes de comecar, me diz seu nome?",
+        reply_markup=ReplyKeyboardRemove(),
     )
-    return False
+    return NOME
 
 
-async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    del context
-    if not update.effective_user or not update.message:
-        return
-    try:
-        balance = await get_balance_api(update.effective_user.id)
-    except Exception as exc:
-        await update.message.reply_text(f"Erro ao consultar saldo: {type(exc).__name__}: {exc}")
-        return
-    await update.message.reply_text(f"Seu saldo: {money_fmt(balance)}", reply_markup=miniapp_kb())
-
-
-async def cmd_recarregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     del context
     if not update.message:
-        return
-    if not MINIAPP_URL:
-        await update.message.reply_text("MINIAPP_URL nao configurada no .env.")
-        return
-    await update.message.reply_text("Clique para recarregar via Pix:", reply_markup=miniapp_kb())
+        return HOME
+
+    text = (update.message.text or "").strip().lower()
+    if text in MENU_TEXTS:
+        await show_menu_message(update.message)
+        return HOME
+
+    if text not in START_TEXTS:
+        await update.message.reply_text("Toque em Iniciar ou Menu para continuar.", reply_markup=home_kb())
+        return HOME
+
+    return await begin_flow(update)
 
 
-async def cmd_servicos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def shortcut_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    init_user_state(context)
+    return await begin_flow(update)
+
+
+async def shortcut_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     del context
     if not update.message:
-        return
-    await update.message.reply_text(
-        "Servicos pagos:\n"
-        f"- Gerar roteiro IA: {money_fmt(COST_ROTEIRO_COMMAND)}\n\n"
-        "Comandos: /saldo /recarregar",
-        reply_markup=miniapp_kb(),
-    )
+        return HOME
+    await show_menu_message(update.message)
+    return HOME
 
 
 async def cmd_meuid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,13 +161,30 @@ def init_user_state(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     init_user_state(context)
     if not update.message:
-        return NOME
+        return HOME
     await update.message.reply_text(
-        "Fala! Antes de comecar, me diz seu nome?\n"
-        f"Custo para gerar roteiro: {money_fmt(COST_ROTEIRO_COMMAND)}",
-        reply_markup=ReplyKeyboardRemove(),
+        WELCOME_TEXT,
+        parse_mode="HTML",
+        reply_markup=home_kb(),
     )
-    return NOME
+    return HOME
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    if not update.message:
+        return
+    await show_menu_message(update.message)
+
+
+async def setup_bot_commands(application: Application) -> None:
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+        await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logging.info("Comandos e menu do bot configurados com sucesso.")
+    except Exception:
+        logging.exception("Falha ao configurar comandos/menu do bot.")
 
 
 async def set_nome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -361,7 +296,7 @@ async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"- Destino: {p['destino']}\n"
         f"- Datas: {p['data_ida']} -> {p['data_volta']}\n"
         f"- Ritmo: {p['ritmo']}\n"
-        f"- Custo: {money_fmt(COST_ROTEIRO_COMMAND)}\n\n"
+        "\n"
         "Confirmar e gerar roteiro? (sim/nao)"
     )
     kb = ReplyKeyboardMarkup([["sim", "nao"]], resize_keyboard=True, one_time_keyboard=True)
@@ -374,9 +309,6 @@ async def confirm_and_generate(update: Update, context: ContextTypes.DEFAULT_TYP
     if ans not in ["sim", "s", "yes"]:
         await update.message.reply_text("Beleza! Se quiser recomecar: /start", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
-
-    if not await charge_or_block(update, COST_ROTEIRO_COMMAND, "gerar roteiro IA"):
-        return CONFIRMAR
 
     p = context.user_data["prefs"]
     prefs = TripPreferences(
@@ -448,25 +380,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def build_telegram_application() -> Application:
     request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
-    application = Application.builder().token(TOKEN).request(request).build()
+    application = Application.builder().token(TOKEN).request(request).post_init(setup_bot_commands).build()
 
-    application.add_handler(CommandHandler("saldo", cmd_saldo))
-    application.add_handler(CommandHandler("recarregar", cmd_recarregar))
-    application.add_handler(CommandHandler("servicos", cmd_servicos))
     application.add_handler(CommandHandler("meuid", cmd_meuid))
+    application.add_handler(CommandHandler("menu", cmd_menu))
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("iniciar", start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & START_SHORTCUT_FILTER, shortcut_start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & MENU_SHORTCUT_FILTER, shortcut_menu),
+        ],
         states={
-            NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_nome)],
-            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_email)],
-            DESTINO: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_destino)],
-            DATA_IDA: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_data_ida)],
-            DATA_VOLTA: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_data_volta)],
-            RITMO: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_ritmo)],
-            CONFIRMAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_and_generate)],
+            HOME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, start_from_text),
+            ],
+            NOME: [MessageHandler(TEXT_FLOW_FILTER, set_nome)],
+            EMAIL: [MessageHandler(TEXT_FLOW_FILTER, set_email)],
+            DESTINO: [MessageHandler(TEXT_FLOW_FILTER, set_destino)],
+            DATA_IDA: [MessageHandler(TEXT_FLOW_FILTER, set_data_ida)],
+            DATA_VOLTA: [MessageHandler(TEXT_FLOW_FILTER, set_data_volta)],
+            RITMO: [MessageHandler(TEXT_FLOW_FILTER, set_ritmo)],
+            CONFIRMAR: [MessageHandler(TEXT_FLOW_FILTER, confirm_and_generate)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("menu", cmd_menu),
+            CommandHandler("start", start),
+            CommandHandler("iniciar", start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & START_SHORTCUT_FILTER, shortcut_start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & MENU_SHORTCUT_FILTER, shortcut_menu),
+        ],
         allow_reentry=True,
     )
 
@@ -476,82 +421,10 @@ def build_telegram_application() -> Application:
     return application
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    global tg_app
-
-    tg_app = build_telegram_application()
-    await tg_app.initialize()
-    await tg_app.start()
-
-    if WEBHOOK_BASE_URL:
-        webhook_url = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
-        await tg_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
-            drop_pending_updates=True,
-        )
-        logging.info("Webhook configurado em %s", webhook_url)
-    else:
-        logging.warning("WEBHOOK_BASE_URL nao definido; set_webhook nao foi chamado.")
-
-    print("Bot rodando Ok")
-    try:
-        yield
-    finally:
-        if tg_app is not None:
-            try:
-                await tg_app.bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                logging.exception("Falha ao remover webhook")
-            await tg_app.stop()
-            await tg_app.shutdown()
-            tg_app = None
-
-
-web_app = FastAPI(title="Projeto IA Viagens Telegram Bot", lifespan=lifespan)
-
-
-@web_app.get("/")
-async def root():
-    return {"ok": True, "mode": "webhook", "health": "/health", "webhook_path": WEBHOOK_PATH}
-
-
-@web_app.get("/health")
-async def health():
-    return {"ok": True}
-
-
-@web_app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    if tg_app is None:
-        raise HTTPException(status_code=503, detail="telegram_app_not_ready")
-
-    if WEBHOOK_SECRET:
-        received_secret = request.headers.get("x-telegram-bot-api-secret-token", "")
-        if received_secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="invalid_secret_token")
-
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid_json:{exc}") from exc
-
-    update = Update.de_json(payload, tg_app.bot)
-    await tg_app.process_update(update)
-    return {"ok": True}
-
-
-@web_app.exception_handler(Exception)
-async def all_exception_handler(_: Request, exc: Exception):
-    return JSONResponse({"error": str(exc)}, status_code=500)
-
-
 def main():
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("bot:web_app", host="0.0.0.0", port=port, log_level="info")
+    app = build_telegram_application()
+    print("Bot rodando Ok")
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
 if __name__ == "__main__":

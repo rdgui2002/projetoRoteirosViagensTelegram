@@ -1,23 +1,11 @@
 services:
-  - type: web
+  - type: worker
     name: projeto-ia-viagens-bot
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn bot:web_app --host 0.0.0.0 --port $PORT
+    startCommand: python bot.py
     autoDeploy: true
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: WEBHOOK_BASE_URL
-        sync: false
-      - key: TELEGRAM_WEBHOOK_SECRET
-        sync: false
-      - key: PUBLIC_BACKEND_BASE
-        sync: false
-      - key: MINIAPP_URL
-        sync: false
-      - key: COST_ROTEIRO_COMMAND
-        value: "1.00"
-      - key: TEST_BYPASS_ENABLED
-        value: "0"
