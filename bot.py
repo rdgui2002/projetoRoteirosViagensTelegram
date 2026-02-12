@@ -4,10 +4,13 @@ import io
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
 
 import httpx
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -20,8 +23,8 @@ from telegram import (
 from telegram.ext import (
     Application,
     CommandHandler,
-    ConversationHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -51,6 +54,12 @@ if not MINIAPP_URL and PUBLIC_BACKEND_BASE:
     MINIAPP_URL = f"{PUBLIC_BACKEND_BASE}/miniapp"
 
 TEST_BYPASS_ENABLED = os.getenv("TEST_BYPASS_ENABLED", "0").strip() == "1"
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = f"/{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -58,6 +67,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 (NOME, EMAIL, DESTINO, DATA_IDA, DATA_VOLTA, RITMO, CONFIRMAR) = range(7)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+tg_app: Application | None = None
 
 
 def _env_decimal(name: str, default: str) -> Decimal:
@@ -286,7 +296,6 @@ async def set_destino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("Manda uma cidade valida. Ex: Cairo.")
         return DESTINO
 
-    # Corrige na hora se for pais/regiao.
     msg_country = await detect_country_destination(destino)
     if msg_country:
         await update.message.reply_text(msg_country)
@@ -327,18 +336,19 @@ async def set_data_volta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Nao entendi a data. Tenta assim: 15/03/2026")
         return DATA_VOLTA
 
-    kb = ReplyKeyboardMarkup([["leve", "médio"], ["intenso"]], resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text("Qual ritmo? (leve / médio / intenso)", reply_markup=kb)
+    kb = ReplyKeyboardMarkup([["leve", "medio"], ["intenso"]], resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("Qual ritmo? (leve / medio / intenso)", reply_markup=kb)
     return RITMO
 
 
 async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ritmo = (update.message.text or "").strip().lower()
-    if ritmo == "medio":
+
+    if ritmo == "medio" and "medio" not in RITMOS_VALIDOS and "médio" in RITMOS_VALIDOS:
         ritmo = "médio"
 
     if ritmo not in RITMOS_VALIDOS:
-        await update.message.reply_text("Escolhe um: leve / médio / intenso")
+        await update.message.reply_text("Escolhe um: leve / medio / intenso")
         return RITMO
 
     context.user_data["prefs"]["ritmo"] = ritmo
@@ -354,7 +364,7 @@ async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"- Custo: {money_fmt(COST_ROTEIRO_COMMAND)}\n\n"
         "Confirmar e gerar roteiro? (sim/nao)"
     )
-    kb = ReplyKeyboardMarkup([["sim", "não"]], resize_keyboard=True, one_time_keyboard=True)
+    kb = ReplyKeyboardMarkup([["sim", "nao"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(resumo, reply_markup=kb)
     return CONFIRMAR
 
@@ -436,14 +446,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.exception("ERR: %s", context.error)
 
 
-def main():
+def build_telegram_application() -> Application:
     request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
-    app = Application.builder().token(TOKEN).request(request).build()
+    application = Application.builder().token(TOKEN).request(request).build()
 
-    app.add_handler(CommandHandler("saldo", cmd_saldo))
-    app.add_handler(CommandHandler("recarregar", cmd_recarregar))
-    app.add_handler(CommandHandler("servicos", cmd_servicos))
-    app.add_handler(CommandHandler("meuid", cmd_meuid))
+    application.add_handler(CommandHandler("saldo", cmd_saldo))
+    application.add_handler(CommandHandler("recarregar", cmd_recarregar))
+    application.add_handler(CommandHandler("servicos", cmd_servicos))
+    application.add_handler(CommandHandler("meuid", cmd_meuid))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -460,12 +470,88 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_error_handler(error_handler)
+    application.add_handler(conv)
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_error_handler(error_handler)
+    return application
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global tg_app
+
+    tg_app = build_telegram_application()
+    await tg_app.initialize()
+    await tg_app.start()
+
+    if WEBHOOK_BASE_URL:
+        webhook_url = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+        await tg_app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+            drop_pending_updates=True,
+        )
+        logging.info("Webhook configurado em %s", webhook_url)
+    else:
+        logging.warning("WEBHOOK_BASE_URL nao definido; set_webhook nao foi chamado.")
 
     print("Bot rodando Ok")
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    try:
+        yield
+    finally:
+        if tg_app is not None:
+            try:
+                await tg_app.bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                logging.exception("Falha ao remover webhook")
+            await tg_app.stop()
+            await tg_app.shutdown()
+            tg_app = None
+
+
+web_app = FastAPI(title="Projeto IA Viagens Telegram Bot", lifespan=lifespan)
+
+
+@web_app.get("/")
+async def root():
+    return {"ok": True, "mode": "webhook", "health": "/health", "webhook_path": WEBHOOK_PATH}
+
+
+@web_app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@web_app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    if tg_app is None:
+        raise HTTPException(status_code=503, detail="telegram_app_not_ready")
+
+    if WEBHOOK_SECRET:
+        received_secret = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if received_secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="invalid_secret_token")
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid_json:{exc}") from exc
+
+    update = Update.de_json(payload, tg_app.bot)
+    await tg_app.process_update(update)
+    return {"ok": True}
+
+
+@web_app.exception_handler(Exception)
+async def all_exception_handler(_: Request, exc: Exception):
+    return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+def main():
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("bot:web_app", host="0.0.0.0", port=port, log_level="info")
 
 
 if __name__ == "__main__":
