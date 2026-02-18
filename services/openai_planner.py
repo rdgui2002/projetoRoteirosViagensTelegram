@@ -111,7 +111,7 @@ def _clean_activity_text(value: str, max_len: int = 180) -> str:
     return short if short else text[:max_len]
 
 
-def _clean_narrative_text(value: str, max_len: int = 700) -> str:
+def _clean_narrative_text(value: str, max_len: int = 1800) -> str:
     text = " ".join((value or "").strip().split())
     if len(text) <= max_len:
         return text
@@ -119,15 +119,13 @@ def _clean_narrative_text(value: str, max_len: int = 700) -> str:
     cut = text[:max_len].strip()
     punctuation_positions = [cut.rfind(". "), cut.rfind("! "), cut.rfind("? ")]
     last_sentence = max(punctuation_positions)
-    if last_sentence >= int(max_len * 0.45):
+    if last_sentence >= int(max_len * 0.30):
         return cut[: last_sentence + 1].strip()
 
-    comma_pos = cut.rfind(",")
-    if comma_pos >= int(max_len * 0.60):
-        cut = cut[:comma_pos].strip()
-
-    cut = cut.rstrip(".!,;: ")
-    return f"{cut}."
+    short = cut.rsplit(" ", 1)[0].strip()
+    short = short if short else cut
+    short = short.rstrip(".!,;: ")
+    return f"{short}..."
 
 
 def _force_portuguese_terms(text: str) -> str:
@@ -278,7 +276,7 @@ def _validate_plan(
             or day.get("descricao")
             or ""
         )
-        texto_dia = _force_portuguese_terms(_clean_narrative_text(raw_day_text, max_len=700))
+        texto_dia = _force_portuguese_terms(_clean_narrative_text(raw_day_text, max_len=1800))
         if texto_dia and texto_dia[-1] not in ".!?":
             texto_dia += "."
 

@@ -186,13 +186,15 @@ WELCOME_TEXT = (
     "- Ajustar sugestoes ao seu ritmo (leve, medio ou intenso)\n"
     "- Gerar PDF e enviar aqui no Telegram\n"
     "- Enviar por e-mail (opcional)\n\n"
-    "<i>Toque em Iniciar para usar este bot.</i>"
+    "<i>Vamos comecar agora.</i>"
 )
+
+DATE_PAST_ERROR_TEXT = "Não é possivel gerar uma data menor que a atual"
 
 MENU_TEXT = (
     "<b>Menu</b>\n"
     "- Iniciar: comeca um novo roteiro\n"
-    "- /start: voltar para a tela inicial\n"
+    "- /start: reiniciar o fluxo do roteiro\n"
     "- /cancel: cancelar o fluxo atual\n"
     "- /meuid: ver seu Telegram ID\n"
     "- /testemode: ver status do bypass de teste"
@@ -408,13 +410,13 @@ def init_user_state(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     init_user_state(context)
     if not update.message:
-        return HOME
+        return NOME
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode="HTML",
-        reply_markup=home_kb(),
+        reply_markup=ReplyKeyboardRemove(),
     )
-    return HOME
+    return await begin_flow(update)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -455,7 +457,7 @@ async def set_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     txt = (update.message.text or "").strip()
     low = txt.lower()
 
-    if low in ["pular", "skip", "nao", "nÃ£o", "sem", "depois"]:
+    if low in ["pular", "skip", "nao", "não", "sem", "depois"]:
         context.user_data["prefs"]["email"] = ""
     else:
         if not EMAIL_RE.match(txt):
@@ -487,7 +489,7 @@ async def set_data_ida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     try:
         d = parse_date_br(update.message.text)
         if d < date.today():
-            await update.message.reply_text("Não é possivel gerar uma data menor que a atual")
+            await update.message.reply_text(DATE_PAST_ERROR_TEXT)
             return DATA_IDA
         context.user_data["prefs"]["data_ida"] = d.strftime("%d/%m/%Y")
     except Exception:
@@ -504,7 +506,7 @@ async def set_data_volta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         volta = parse_date_br(update.message.text)
 
         if volta < date.today():
-            await update.message.reply_text("Não é possivel gerar uma data menor que a atual")
+            await update.message.reply_text(DATE_PAST_ERROR_TEXT)
             return DATA_VOLTA
 
         if ida > volta:
