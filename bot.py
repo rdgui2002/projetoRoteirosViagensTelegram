@@ -4,17 +4,24 @@ import io
 import logging
 import os
 import re
+import unicodedata
+from datetime import date
+from decimal import Decimal, InvalidOperation
 
+import httpx
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputFile,
     KeyboardButton,
     MenuButtonCommands,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -30,11 +37,10 @@ from services.email_service import send_email_with_pdf
 from services.pdf_service import build_pdf_bytes
 from services.presenter import format_trip_output, trip_to_pdf_lines
 from services.trip_logic_wikivoyage import (
-    DestinationIsCountryError,
+    AIServiceUnavailableError,
     RITMOS_VALIDOS,
     TripPreferences,
     build_itinerary_from_wikivoyage,
-    detect_country_destination,
 )
 from services.utils import parse_date_br
 
@@ -44,10 +50,126 @@ TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip(
 if not TOKEN:
     raise SystemExit("ERRO: defina TELEGRAM_BOT_TOKEN (ou BOT_TOKEN) no .env")
 
+PUBLIC_BACKEND_BASE = os.getenv("PUBLIC_BACKEND_BASE", "").strip().rstrip("/")
+MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip()
+if not MINIAPP_URL and PUBLIC_BACKEND_BASE:
+    MINIAPP_URL = f"{PUBLIC_BACKEND_BASE}/miniapp"
+
+
+def _env_decimal(name: str, default: str) -> Decimal:
+    raw = (os.getenv(name) or default).strip()
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        logging.warning("Valor invalido em %s=%r. Usando %s", name, raw, default)
+        return Decimal(default)
+
+
+def _env_float(name: str, default: str) -> float:
+    raw = (os.getenv(name) or default).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        logging.warning("Valor invalido em %s=%r. Usando %s", name, raw, default)
+        return float(default)
+
+
+def _env_user_ids(name: str) -> set[int]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return set()
+
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.add(int(part))
+        except ValueError:
+            logging.warning("Ignorando user_id invalido em %s: %r", name, part)
+    return values
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return (os.getenv(name) or default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_gostos_text(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+
+    low = raw.lower()
+    if low in {"nenhum", "nao", "sem", "indiferente", "tanto faz"}:
+        return []
+
+    parts = re.split(r"[,;/|\n]+", raw)
+    out: list[str] = []
+    seen = set()
+    for part in parts:
+        clean = re.sub(r"\s+", " ", part.strip().lower())
+        if len(clean) < 2:
+            continue
+        if clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _fold_text(text: str) -> str:
+    raw = (text or "").strip().lower()
+    normalized = unicodedata.normalize("NFKD", raw)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _split_long_text(text: str, max_chars: int = 3500) -> list[str]:
+    content = (text or "").strip()
+    if len(content) <= max_chars:
+        return [content] if content else []
+
+    chunks: list[str] = []
+    remaining = content
+
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining.strip())
+            break
+
+        cut = remaining.rfind("\n\n", 0, max_chars + 1)
+        if cut < int(max_chars * 0.40):
+            cut = remaining.rfind("\n", 0, max_chars + 1)
+        if cut < int(max_chars * 0.40):
+            cut = remaining.rfind(". ", 0, max_chars + 1)
+            if cut != -1:
+                cut += 1
+        if cut < int(max_chars * 0.40):
+            cut = max_chars
+
+        chunk = remaining[:cut].strip()
+        if not chunk:
+            chunk = remaining[:max_chars].strip()
+            cut = len(chunk)
+
+        chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+
+    return [c for c in chunks if c]
+
+
+COST_ROTEIRO_COMMAND = _env_decimal("COST_ROTEIRO_COMMAND", "1.00")
+WALLET_HTTP_TIMEOUT = _env_float("WALLET_HTTP_TIMEOUT", "20")
+BALANCE_ENFORCEMENT_ENABLED = _env_bool("BALANCE_ENFORCEMENT_ENABLED", "0")
+TEST_BYPASS_ENABLED = _env_bool("TEST_BYPASS_ENABLED", "0")
+TEST_BYPASS_USER_IDS = _env_user_ids("TEST_BYPASS_USER_IDS")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Conversation states
-(HOME, NOME, EMAIL, DESTINO, DATA_IDA, DATA_VOLTA, RITMO, CONFIRMAR) = range(8)
+(HOME, NOME, EMAIL, DESTINO, DATA_IDA, DATA_VOLTA, RITMO, GOSTOS, CONFIRMAR) = range(9)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 START_TEXTS = {"iniciar", "comecar", "start"}
@@ -72,7 +194,8 @@ MENU_TEXT = (
     "- Iniciar: comeca um novo roteiro\n"
     "- /start: voltar para a tela inicial\n"
     "- /cancel: cancelar o fluxo atual\n"
-    "- /meuid: ver seu Telegram ID"
+    "- /meuid: ver seu Telegram ID\n"
+    "- /testemode: ver status do bypass de teste"
 )
 
 BOT_COMMANDS = [
@@ -81,6 +204,7 @@ BOT_COMMANDS = [
     BotCommand("menu", "Abrir menu"),
     BotCommand("cancel", "Cancelar"),
     BotCommand("meuid", "Ver meu ID"),
+    BotCommand("testemode", "Status modo teste"),
 ]
 
 
@@ -90,6 +214,94 @@ def home_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
+
+def money_fmt(value: Decimal) -> str:
+    return f"R$ {value.quantize(Decimal('0.01'))}"
+
+
+def miniapp_kb() -> InlineKeyboardMarkup | None:
+    if not MINIAPP_URL:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Recarregar via Pix", web_app=WebAppInfo(url=MINIAPP_URL))]
+        ]
+    )
+
+
+def is_bypass_user(telegram_id: int) -> bool:
+    if not TEST_BYPASS_ENABLED:
+        return False
+    if not TEST_BYPASS_USER_IDS:
+        return True
+    return telegram_id in TEST_BYPASS_USER_IDS
+
+
+async def get_balance_api(telegram_id: int) -> Decimal:
+    if not PUBLIC_BACKEND_BASE:
+        raise RuntimeError("PUBLIC_BACKEND_BASE_not_configured")
+    async with httpx.AsyncClient(timeout=WALLET_HTTP_TIMEOUT) as client:
+        response = await client.get(
+            f"{PUBLIC_BACKEND_BASE}/api/balance",
+            params={"telegram_id": telegram_id},
+        )
+    response.raise_for_status()
+    data = response.json()
+    return Decimal(str(data["balance"]))
+
+
+async def spend_api(telegram_id: int, amount: Decimal) -> dict | None:
+    if not PUBLIC_BACKEND_BASE:
+        raise RuntimeError("PUBLIC_BACKEND_BASE_not_configured")
+    async with httpx.AsyncClient(timeout=WALLET_HTTP_TIMEOUT) as client:
+        response = await client.post(
+            f"{PUBLIC_BACKEND_BASE}/api/spend",
+            json={"telegram_id": telegram_id, "amount": str(amount)},
+        )
+    if response.status_code == 402:
+        return None
+    response.raise_for_status()
+    return response.json()
+
+
+async def charge_or_block(update: Update, amount: Decimal, service_name: str) -> bool:
+    if not update.message or not update.effective_user:
+        return False
+
+    if amount <= 0:
+        return True
+
+    if not BALANCE_ENFORCEMENT_ENABLED:
+        return True
+
+    if is_bypass_user(update.effective_user.id):
+        await update.message.reply_text("Modo teste ativo para seu usuario. Saldo ignorado neste teste.")
+        return True
+
+    try:
+        spend_result = await spend_api(update.effective_user.id, amount)
+    except Exception as exc:
+        await update.message.reply_text(f"Erro ao cobrar saldo: {type(exc).__name__}: {exc}")
+        return False
+
+    if spend_result is not None:
+        return True
+
+    try:
+        balance = await get_balance_api(update.effective_user.id)
+        balance_text = money_fmt(balance)
+    except Exception:
+        balance_text = "indisponivel"
+
+    await update.message.reply_text(
+        f"Saldo insuficiente para {service_name}.\n"
+        f"Custo: {money_fmt(amount)}\n"
+        f"Seu saldo: {balance_text}\n\n"
+        "Recarregue para continuar:",
+        reply_markup=miniapp_kb(),
+    )
+    return False
 
 
 async def show_menu_message(target_message) -> None:
@@ -147,6 +359,40 @@ async def cmd_meuid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Seu Telegram ID: {update.effective_user.id}")
 
 
+async def cmd_testemode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    if not update.effective_user or not update.message:
+        return
+
+    user_id = update.effective_user.id
+    bypass_for_user = is_bypass_user(user_id)
+    bypass_scope = (
+        "todos os usuarios"
+        if TEST_BYPASS_ENABLED and not TEST_BYPASS_USER_IDS
+        else "apenas IDs em TEST_BYPASS_USER_IDS"
+    )
+    lines = [
+        "Status do modo teste:",
+        f"- BALANCE_ENFORCEMENT_ENABLED: {'1' if BALANCE_ENFORCEMENT_ENABLED else '0'}",
+        f"- TEST_BYPASS_ENABLED: {'1' if TEST_BYPASS_ENABLED else '0'} ({bypass_scope})",
+        f"- Seu Telegram ID: {user_id}",
+        f"- Seu bypass ativo: {'SIM' if bypass_for_user else 'NAO'}",
+        f"- Custo configurado: {money_fmt(COST_ROTEIRO_COMMAND)}",
+    ]
+
+    if BALANCE_ENFORCEMENT_ENABLED and bypass_for_user:
+        lines.append("")
+        lines.append("Voce esta liberado para testar sem saldo.")
+    elif BALANCE_ENFORCEMENT_ENABLED and not bypass_for_user:
+        lines.append("")
+        lines.append("Saldo sera exigido para gerar roteiro.")
+    else:
+        lines.append("")
+        lines.append("Cobranca por saldo esta desativada globalmente.")
+
+    await update.message.reply_text("\n".join(lines), reply_markup=miniapp_kb())
+
+
 def init_user_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prefs"] = {
         "nome": "",
@@ -155,6 +401,7 @@ def init_user_state(context: ContextTypes.DEFAULT_TYPE):
         "data_ida": "",
         "data_volta": "",
         "ritmo": "",
+        "gostos": [],
     }
 
 
@@ -208,7 +455,7 @@ async def set_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     txt = (update.message.text or "").strip()
     low = txt.lower()
 
-    if low in ["pular", "skip", "nao", "não", "sem", "depois"]:
+    if low in ["pular", "skip", "nao", "nÃ£o", "sem", "depois"]:
         context.user_data["prefs"]["email"] = ""
     else:
         if not EMAIL_RE.match(txt):
@@ -231,12 +478,6 @@ async def set_destino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("Manda uma cidade valida. Ex: Cairo.")
         return DESTINO
 
-    msg_country = await detect_country_destination(destino)
-    if msg_country:
-        await update.message.reply_text(msg_country)
-        await update.message.reply_text("Agora me diga a CIDADE (ex: Cairo, Luxor, Aswan).")
-        return DESTINO
-
     context.user_data["prefs"]["destino"] = destino
     await update.message.reply_text("Data de ida? (ex: 10/03/2026)")
     return DATA_IDA
@@ -245,6 +486,9 @@ async def set_destino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def set_data_ida(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         d = parse_date_br(update.message.text)
+        if d < date.today():
+            await update.message.reply_text("Não é possivel gerar uma data menor que a atual")
+            return DATA_IDA
         context.user_data["prefs"]["data_ida"] = d.strftime("%d/%m/%Y")
     except Exception:
         await update.message.reply_text("Nao entendi a data. Tenta assim: 10/03/2026")
@@ -259,11 +503,16 @@ async def set_data_volta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ida = parse_date_br(context.user_data["prefs"]["data_ida"])
         volta = parse_date_br(update.message.text)
 
-        if volta <= ida:
-            await update.message.reply_text(
-                "Essa volta esta antes (ou igual) a ida. A volta precisa ser depois.\n"
-                "Tenta de novo (ex: 15/03/2026)."
-            )
+        if volta < date.today():
+            await update.message.reply_text("Não é possivel gerar uma data menor que a atual")
+            return DATA_VOLTA
+
+        if ida > volta:
+            await update.message.reply_text("A data de ida nao pode ser maior que a de volta.")
+            return DATA_VOLTA
+
+        if ida == volta:
+            await update.message.reply_text("A data de volta precisa ser depois da ida.")
             return DATA_VOLTA
 
         context.user_data["prefs"]["data_volta"] = volta.strftime("%d/%m/%Y")
@@ -277,18 +526,28 @@ async def set_data_volta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ritmo = (update.message.text or "").strip().lower()
-
-    if ritmo == "medio" and "medio" not in RITMOS_VALIDOS and "médio" in RITMOS_VALIDOS:
-        ritmo = "médio"
-
-    if ritmo not in RITMOS_VALIDOS:
+    ritmo_raw = (update.message.text or "").strip()
+    ritmo_fold = _fold_text(ritmo_raw)
+    ritmo = next((item for item in RITMOS_VALIDOS if _fold_text(item) == ritmo_fold), "")
+    if not ritmo:
         await update.message.reply_text("Escolhe um: leve / medio / intenso")
         return RITMO
 
     context.user_data["prefs"]["ritmo"] = ritmo
+    await update.message.reply_text(
+        "Agora me conta seus gostos pessoais para eu priorizar no roteiro.\n"
+        "Ex: praia, museus, gastronomia, vida noturna, trilhas, historia.\n"
+        "Pode separar por virgula. Se nao tiver preferencia, responde: nenhum"
+    )
+    return GOSTOS
+
+
+async def set_gostos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    gostos = _parse_gostos_text(update.message.text or "")
+    context.user_data["prefs"]["gostos"] = gostos
 
     p = context.user_data["prefs"]
+    gostos_text = ", ".join(p["gostos"]) if p["gostos"] else "sem preferencia"
     resumo = (
         "Resumo\n"
         f"- Nome: {p['nome']}\n"
@@ -296,6 +555,7 @@ async def set_ritmo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"- Destino: {p['destino']}\n"
         f"- Datas: {p['data_ida']} -> {p['data_volta']}\n"
         f"- Ritmo: {p['ritmo']}\n"
+        f"- Gostos: {gostos_text}\n"
         "\n"
         "Confirmar e gerar roteiro? (sim/nao)"
     )
@@ -310,6 +570,9 @@ async def confirm_and_generate(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Beleza! Se quiser recomecar: /start", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
+    if not await charge_or_block(update, COST_ROTEIRO_COMMAND, "gerar roteiro IA"):
+        return CONFIRMAR
+
     p = context.user_data["prefs"]
     prefs = TripPreferences(
         nome=p["nome"],
@@ -317,23 +580,22 @@ async def confirm_and_generate(update: Update, context: ContextTypes.DEFAULT_TYP
         data_ida=p["data_ida"],
         data_volta=p["data_volta"],
         ritmo=p["ritmo"],
+        gostos=p.get("gostos") or [],
     )
 
     await update.message.reply_text("Boa! To montando seu roteiro...", reply_markup=ReplyKeyboardRemove())
 
     try:
         trip = await build_itinerary_from_wikivoyage(prefs)
-    except DestinationIsCountryError as exc:
-        await update.message.reply_text(str(exc))
-        await update.message.reply_text("Me manda a CIDADE (ex: Cairo).")
-        return DESTINO
+    except AIServiceUnavailableError:
+        await update.message.reply_text("Serviço indisponivel no momento pro cliente")
+        return ConversationHandler.END
     except Exception as exc:
         await update.message.reply_text(f"Deu ruim ao gerar o roteiro: {exc}")
         return ConversationHandler.END
 
     out = format_trip_output(trip)
-    max_chars = 3500
-    chunks = [out[i : i + max_chars] for i in range(0, len(out), max_chars)]
+    chunks = _split_long_text(out, max_chars=3500)
     for chunk in chunks:
         await update.message.reply_text(chunk)
 
@@ -384,6 +646,7 @@ def build_telegram_application() -> Application:
 
     application.add_handler(CommandHandler("meuid", cmd_meuid))
     application.add_handler(CommandHandler("menu", cmd_menu))
+    application.add_handler(CommandHandler("testemode", cmd_testemode))
 
     conv = ConversationHandler(
         entry_points=[
@@ -402,6 +665,7 @@ def build_telegram_application() -> Application:
             DATA_IDA: [MessageHandler(TEXT_FLOW_FILTER, set_data_ida)],
             DATA_VOLTA: [MessageHandler(TEXT_FLOW_FILTER, set_data_volta)],
             RITMO: [MessageHandler(TEXT_FLOW_FILTER, set_ritmo)],
+            GOSTOS: [MessageHandler(TEXT_FLOW_FILTER, set_gostos)],
             CONFIRMAR: [MessageHandler(TEXT_FLOW_FILTER, confirm_and_generate)],
         },
         fallbacks=[
@@ -429,3 +693,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
