@@ -1,56 +1,72 @@
-# projetoRoteirosViagensTelegram
+# Projeto Roteiros de Viagem com IA
 
-Deploy no Render (Polling / Worker):
+Este projeto nasceu como uma prova de conceito para transformar planejamento de viagens em uma experiência conversacional, integrada ao Telegram e apoiada por IA. A ideia principal é entregar roteiros personalizados de forma natural, com geração automática de conteúdo e distribuição em texto e PDF.
 
-- Tipo de servico: `Worker`
+Como visão de evolução, a proposta é transformar essa base em um ecossistema de conteúdo digital, incluindo um blog alimentado por matérias geradas por IA, com foco em automação, personalização e escalabilidade.
+
+## O que o projeto faz
+
+- Recebe informações do usuário pelo Telegram.
+- Coleta destino, datas, ritmo de viagem e preferências.
+- Gera um roteiro estruturado com apoio de IA.
+- Monta uma resposta amigável e cria um PDF para envio.
+- Pode enviar o roteiro por e-mail, quando configurado.
+
+## Stack utilizada
+
+- Python
+- python-telegram-bot
+- OpenAI API
+- ReportLab / geração de PDF
+- Render para deploy
+
+## Arquitetura do projeto
+
+- `bot.py`: fluxo de conversa e integração com o Telegram.
+- `services/trip_logic_wikivoyage.py`: orquestração do roteiro e validação do fluxo.
+- `services/openai_planner.py`: construção do prompt e integração com a API da OpenAI.
+- `services/presenter.py`: transforma o roteiro em texto legível e estruturado.
+- `services/pdf_service.py`: gera o PDF final com marca visual.
+
+## Como rodar localmente
+
+1. Crie um ambiente virtual.
+2. Instale as dependências:
+   `pip install -r requirements.txt`
+3. Copie o arquivo `.env.example` para `.env` e preencha os valores.
+4. Execute:
+   `python bot.py`
+
+## Variáveis de ambiente
+
+As variáveis principais são:
+
+- `TELEGRAM_BOT_TOKEN`: token do bot no Telegram.
+- `OPENAI_API_KEY`: chave da OpenAI para gerar roteiros.
+- `OPENAI_MODEL`: modelo usado para geração (padrão `gpt-4o-mini`).
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`: envio de e-mail.
+- `PDF_WATERMARK_IMAGE_PATH`: caminho para marca no PDF.
+
+## Deploy
+
+Configuração básica para Render:
+
+- Tipo de serviço: `Worker`
 - Build Command: `pip install -r requirements.txt`
 - Start Command: `python bot.py`
 
-Variaveis minimas:
+## Segurança
 
-- `TELEGRAM_BOT_TOKEN`
+- O arquivo `.env` não é versionado e deve ficar apenas localmente.
+- Credenciais reais nunca devem ser adicionadas ao repositório.
+- Use o arquivo `.env.example` como referência para configurar o ambiente.
 
-Variaveis opcionais (OpenAI para gerar roteiro por IA):
+## Destaque para entrevista
 
-- `OPENAI_API_KEY`: ativa geracao de roteiro com OpenAI.
-- `OPENAI_MODEL` (padrao `gpt-4o-mini`): modelo usado para montar o dia a dia.
-- `OPENAI_API_BASE` (padrao `https://api.openai.com/v1`): endpoint base da API.
-- `OPENAI_TIMEOUT` (padrao `45`): timeout da chamada em segundos.
-- Sem OpenAI disponivel (chave ausente, erro de auth, quota/credito insuficiente), o bot responde:
-  `Servico indisponivel no momento pro cliente`
+Este projeto demonstra habilidades em:
 
-Variavel opcional (marca no PDF):
-
-- `PDF_WATERMARK_IMAGE_PATH`: caminho da imagem da marca do PDF (ex.: `assets/icone.png`).
-
-Variaveis opcionais (envio por e-mail):
-
-- `SMTP_HOST`
-- `SMTP_PORT`
-- `SMTP_USER`
-- `SMTP_PASS`
-- `SMTP_FROM`
-
-Variaveis opcionais (saldo / modo teste):
-
-- `BALANCE_ENFORCEMENT_ENABLED` (padrao `0`): quando `1`, exige saldo para gerar roteiro.
-- `PUBLIC_BACKEND_BASE`: backend com endpoints `/api/balance` e `/api/spend`.
-- `MINIAPP_URL`: link do miniapp de recarga via Pix.
-- `COST_ROTEIRO_COMMAND` (padrao `1.00`): valor cobrado por roteiro.
-- `TEST_BYPASS_ENABLED` (padrao `0`): ativa bypass de teste.
-- `TEST_BYPASS_USER_IDS`: IDs Telegram separados por virgula. Se vazio e `TEST_BYPASS_ENABLED=1`, libera todos.
-
-Teste sem saldo (recomendado para desenvolvimento):
-
-1. Deixe `BALANCE_ENFORCEMENT_ENABLED=1` se quiser testar tambem o fluxo de cobranca.
-2. Configure `TEST_BYPASS_ENABLED=1`.
-3. Configure seu ID em `TEST_BYPASS_USER_IDS` (ou deixe vazio para liberar todos no ambiente local).
-4. No Telegram, rode `/testemode` para validar se seu bypass esta ativo.
-
-Arquitetura (resumo):
-
-- `bot.py`: fluxo de conversa, coleta preferencias e responde no Telegram.
-- `services/trip_logic_wikivoyage.py`: camada de orquestracao do roteiro (mantem nome legado por compatibilidade), valida entradas e chama IA.
-- `services/openai_planner.py`: monta prompt, chama OpenAI, valida JSON e estrutura do roteiro.
-- `services/presenter.py`: transforma o roteiro em texto natural para mensagem e PDF.
-- `services/pdf_service.py`: renderiza o PDF final com layout e marca discreta.
+- Automação de fluxos conversacionais.
+- Integração com APIs externas.
+- Geração de conteúdo com IA.
+- Transformação de dados em produtos úteis para o usuário.
+- Estruturação de um projeto com potencial de evolução para produtos de conteúdo e automação.
